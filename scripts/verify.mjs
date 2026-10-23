@@ -38,6 +38,7 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
   const scrolledTo = [];
   const console_ = { log: [], warn: [] };
   const store = new Map(stored === null ? [] : [[STORAGE_KEY, JSON.stringify(stored)]]);
+  let clock = 0;
 
   const el = (tag) => {
     const node = {
@@ -123,6 +124,7 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
       removeItem: (k) => { store.delete(k); },
     },
     visualViewport: viewport,
+    performance: { now: () => clock },
     requestAnimationFrame: (cb) => { frames.push(cb); return frames.length; },
     cancelAnimationFrame: (id) => { if (typeof id === "number" && id > 0) frames.splice(id - 1, 1); },
     setTimeout: (cb, ms) => { timers.push({ cb, ms }); return timers.length; },
@@ -145,10 +147,24 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
     (listeners.viewport[type] ?? []).forEach((f) => f());
     flush();
   };
+  /** Run the watchdog frames one at a time while the fake clock advances. */
+  const tick = (stepMs = 16, steps = 20) => {
+    for (let i = 0; i < steps; i++) {
+      clock += stepMs;
+      if (frames.length === 0) break;
+      flush();
+    }
+  };
+  /** Advance the clock, run the timers, then let the watchdog settle. */
+  const advance = (ms) => {
+    clock += ms;
+    runTimers();
+    tick(16, 4);
+  };
 
   return {
     windowRef, doc, documentElement, body, registry, listeners, frames, timers, scrolledTo,
-    console: console_, flush, fireViewportEvent, viewport, runTimers,
+    console: console_, flush, fireViewportEvent, viewport, runTimers, tick, advance, now: () => clock,
   };
 }
 
@@ -313,6 +329,8 @@ console.log("\nBox model: the shell spans the band exactly");
 
   setBand(b, 1194);
   b.fireViewportEvent();
+  check("padding held during the close grace", bodyPadVar(b), "0px");
+  b.tick();
   check("body padding returns", bodyPadVar(b), "24px");
 }
 
@@ -420,6 +438,8 @@ console.log("\nDocument scroll is pinned only while the keyboard is open");
   check("locked while open", locked(b), true);
   setBand(b, 1194);
   b.fireViewportEvent();
+  check("still locked during the close grace", locked(b), true);
+  b.tick();
   check("unlocked when closed", locked(b), false);
 }
 {
@@ -446,6 +466,7 @@ console.log("\nscrollReset policy");
 
   setBand(b, 1194);
   b.fireViewportEvent();
+  b.advance(250);
   setBand(b, 874);
   b.windowRef.scrollY = 120;
   b.fireViewportEvent();
@@ -476,6 +497,9 @@ console.log("\nKeyboard closes, and a small shortfall is not a keyboard");
   b.fireViewportEvent();
   setBand(b, 1194);
   b.fireViewportEvent();
+  check("pin held during the close grace", keyboard(b), true);
+  check("height held during the close grace", heightVar(b), "874px");
+  b.advance(250);
   check("keyboard class removed", keyboard(b), false);
   check("height override removed", heightVar(b), undefined);
   check("inline body height removed", inlineHeight(b), "");
@@ -489,6 +513,55 @@ console.log("\nKeyboard closes, and a small shortfall is not a keyboard");
   setBand(b, 1154);
   b.fireViewportEvent();
   check("minOverlap:10 treats 40px as a keyboard", keyboard(b), true);
+}
+
+console.log("\nA short closed report does not release the pin");
+{
+  const b = boot({ standalone: true, envTop: 24, layoutHeight: 1468 });
+  setBand(b, 1015);
+  b.fireViewportEvent();
+  check("keyboard pinned", heightVar(b), "1015px");
+
+  // iPadOS reports the full height for a few frames during a scroll.
+  setBand(b, 1468);
+  b.fireViewportEvent();
+  check("one closed report keeps the pin", heightVar(b), "1015px");
+  check("root stays locked", locked(b), true);
+
+  b.tick(16, 5);
+  check("80ms of closed band still keeps the pin", heightVar(b), "1015px");
+  b.tick(16, 10);
+  check("the pin is released after the grace", heightVar(b), undefined);
+}
+
+console.log("\nRotation drops the pin and rejects the old layout height");
+{
+  const b = boot({ standalone: true, envTop: 24, layoutHeight: 1468 });
+  setBand(b, 1015);
+  b.fireViewportEvent();
+  check("portrait keyboard pinned", heightVar(b), "1015px");
+
+  // Portrait -> landscape: the layout height and the viewport width change.
+  b.viewport.width = 1468;
+  b.documentElement.clientHeight = 950;
+  setBand(b, 1468);
+  b.fireViewportEvent();
+  check("rotation releases the stale pin", keyboard(b), false);
+  check("no blank body height", inlineHeight(b), "");
+
+  // Landscape -> portrait: the visual viewport keeps the old layout height.
+  b.viewport.width = 834;
+  b.documentElement.clientHeight = 1468;
+  setBand(b, 949);
+  b.fireViewportEvent();
+  check("no false pin during the rotation grace", keyboard(b), false);
+  b.advance(400);
+  check("no false pin after the grace", keyboard(b), false);
+
+  // The real keyboard band is not the old layout height.
+  setBand(b, 1015);
+  b.fireViewportEvent();
+  check("the settled band pins", heightVar(b), "1015px");
 }
 
 console.log("\nMeasured iOS state: innerHeight collapses, offsetTop tracks scroll");

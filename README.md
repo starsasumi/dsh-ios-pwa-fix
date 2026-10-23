@@ -44,6 +44,13 @@ Reload the GUI. Then fully close the Home Screen app and open it again.
 
 Tested on iPhone and iPad running iOS and iPadOS 18, in portrait and landscape.
 
+## How it works
+
+- The plugin reserves the status-bar strip only when the page spans the screen.
+- While the keyboard is open, it pins the page to the visible band.
+- It keeps text fields at 16px or more, so WebKit does not zoom on focus.
+- It changes layout only. It does not change text input or keyboard sounds.
+
 ## Troubleshooting
 
 | symptom | action |
@@ -99,7 +106,9 @@ npm pack --dry-run
 
 The browser half is a hand-written bundle in `lib/client.js`. It has no build
 step and no imports. The Host half in `lib/index.js` is a no-op entry that lets
-the profile load the package.
+the profile load the package. The test suite runs against a stubbed DOM.
+
+See [release-notes.md](release-notes.md) for changes.
 
 ### Environment detection
 
