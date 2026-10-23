@@ -1,0 +1,7 @@
+# dsh-ios-pwa-fix — loader row for the iPhone and iPad Home Screen layout patch.
+#
+# The package's `dsh.client` declaration (package.json) makes the Host serve
+# lib/client.js as a browser bundle. `immediately: true` materialises it at boot.
+- insert:
+    - id: ios-pwa-fix
+      name: 'dsh-ios-pwa-fix'
