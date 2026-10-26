@@ -4,7 +4,8 @@
  *
  * The stub cannot prove how iOS lays out a Home Screen app. It checks the patch
  * logic: standalone gating, strip selection, keyboard pinning, measured iOS
- * geometry, watchdog, scroll policy, and cleanup.
+ * geometry, watchdog, scroll policy, the optional key bar, the group switches,
+ * and cleanup.
  *
  *   node scripts/verify.mjs
  */
@@ -28,6 +29,10 @@ const findStyle = (b, needle) => {
   const el = b.registry.find((e) => e.id === "dsh-ios-pwa-fix-style");
   return el ? el.textContent.includes(needle) : false;
 };
+const findKeyBarStyle = (b, needle) => {
+  const el = b.registry.find((e) => e.id === "dsh-ios-pwa-keybar-style");
+  return el ? el.textContent.includes(needle) : false;
+};
 
 /** A DOM just big enough for the patch, with every hook it touches made observable. */
 function makeEnvironment({ standalone = true, navigatorStandalone = standalone, displayMode = standalone ? "standalone" : "browser", userAgent = "iPad", maxTouchPoints = 5, envTop = 0, stored = null, innerHeight = 1194, offsetTop = 0, layoutHeight = 0, screenHeight = 0, scale = 1 } = {}) {
@@ -46,9 +51,18 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
       id: "",
       textContent: "",
       cssText: "",
+      className: "",
+      type: "",
+      value: "",
+      selectionStart: 0,
+      selectionEnd: 0,
+      selectionDirection: "none",
+      isContentEditable: false,
       parent: null,
       children: [],
       _classes: new Set(),
+      _attributes: {},
+      _listeners: {},
       style: (() => {
         const style = {
           _p: {},
@@ -67,6 +81,27 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
         remove: (...c) => c.forEach((x) => node._classes.delete(x)),
         contains: (c) => node._classes.has(c),
       },
+      setAttribute(name, value) {
+        node._attributes[name] = String(value);
+      },
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(node._attributes, name) ? node._attributes[name] : null;
+      },
+      setSelectionRange(start, end, direction) {
+        node.selectionStart = start;
+        node.selectionEnd = end;
+        if (direction) node.selectionDirection = direction;
+      },
+      addEventListener(type, fn) {
+        (node._listeners[type] ??= []).push(fn);
+      },
+      removeEventListener(type, fn) {
+        node._listeners[type] = (node._listeners[type] ?? []).filter((f) => f !== fn);
+      },
+      dispatchEvent(event) {
+        for (const fn of node._listeners[event.type] ?? []) fn(event);
+        return event.defaultPrevented !== true;
+      },
       appendChild(child) {
         child.parent = node;
         node.children.push(child);
@@ -83,6 +118,30 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
     return node;
   };
 
+  /** The stub keyboard event enough for the key bar checks. */
+  class FakeKeyboardEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      for (const [key, value] of Object.entries(init)) this[key] = value;
+      this.defaultPrevented = false;
+      this.timeStamp = 0;
+    }
+    preventDefault() {
+      this.defaultPrevented = true;
+    }
+  }
+
+  class FakeEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.defaultPrevented = false;
+      this.bubbles = init.bubbles === true;
+    }
+    preventDefault() {
+      this.defaultPrevented = true;
+    }
+  }
+
   const documentElement = el("html");
   // iOS keeps `innerHeight` moving with the keyboard and with scroll. Tests opt
   // in to `clientHeight`, so the default cases still use `innerHeight`.
@@ -93,8 +152,17 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
     documentElement,
     body,
     head,
+    activeElement: body,
     createElement: el,
     getElementById: (id) => registry.find((e) => e.id === id) ?? null,
+    querySelector: (selector) => (selector === "[data-composer-input]" ? doc.composer ?? null : null),
+    execCommand: () => false,
+  };
+  doc.composer = null;
+
+  const selectionMoves = [];
+  const selection = {
+    modify: (alter, direction, granularity) => selectionMoves.push([alter, direction, granularity]),
   };
 
   const viewport = {
@@ -112,7 +180,7 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
     scrollX: 0,
     scrollY: 0,
     screen: { height: screenHeight > 0 ? screenHeight : innerHeight },
-    navigator: { standalone: navigatorStandalone, maxTouchPoints, userAgent },
+    navigator: { standalone: navigatorStandalone, maxTouchPoints, userAgent, language: "en" },
     matchMedia: (q) => {
       if (q === "(display-mode: fullscreen)") return { matches: displayMode === "fullscreen" };
       if (q === "(display-mode: standalone)") return { matches: displayMode === "standalone" };
@@ -132,6 +200,9 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
     scrollTo: (x, y) => scrolledTo.push([x, y]),
     addEventListener: (t, fn) => { (listeners.window[t] ??= []).push(fn); },
     removeEventListener: (t, fn) => { listeners.window[t] = (listeners.window[t] ?? []).filter((f) => f !== fn); },
+    getSelection: () => selection,
+    KeyboardEvent: FakeKeyboardEvent,
+    Event: FakeEvent,
     __ModuleLoader__: { load: (def) => { windowRef.__def = def; } },
   };
 
@@ -163,19 +234,25 @@ function makeEnvironment({ standalone = true, navigatorStandalone = standalone, 
   };
 
   return {
-    windowRef, doc, documentElement, body, registry, listeners, frames, timers, scrolledTo,
+    windowRef, doc, documentElement, body, registry, listeners, frames, timers, scrolledTo, selection, selectionMoves,
     console: console_, flush, fireViewportEvent, viewport, runTimers, tick, advance, now: () => clock,
   };
 }
 
 /** Loads the bundle into a fresh environment and applies it; returns the patch and a disposer. */
-function boot(envOptions) {
+function boot(envOptions, extras = {}) {
   const env = makeEnvironment(envOptions);
   const sink = { log: (...a) => env.console.log.push(a), warn: (...a) => env.console.warn.push(a) };
   new Function("window", "console", readFileSync(SOURCE, "utf8"))(env.windowRef, sink);
-  const exported = env.windowRef.__def.factory(() => { throw new Error("no requires expected"); });
+  const exported = env.windowRef.__def.factory((id) => {
+    if (extras.requires && Object.prototype.hasOwnProperty.call(extras.requires, id)) return extras.requires[id];
+    throw new Error("no requires expected");
+  });
   let disposer = null;
-  exported.apply({ effect: (fn) => { disposer = fn(); } });
+  exported.apply({
+    effect: (fn) => { disposer = fn(); },
+    ...(extras.context ?? {}),
+  });
   env.dispose = () => disposer?.();
   env.exports = exported;
   return env;
@@ -187,6 +264,32 @@ const bodyPadVar = (b) => b.documentElement.style.getPropertyValue("--dsh-ios-bo
 const inlineHeight = (b) => b.body.style.height;
 const keyboard = (b) => b.documentElement.classList.contains("dsh-ios-keyboard");
 const locked = (b) => b.documentElement.classList.contains("dsh-ios-locked");
+const keyBar = (b) => b.registry.find((e) => e.id === "dsh-ios-pwa-keybar") ?? null;
+const keyBarOn = (b) => b.documentElement.classList.contains("dsh-ios-keybar");
+const barButton = (b, label) => (keyBar(b)?.children ?? []).find((e) => e.textContent === label) ?? null;
+const visibleBarButtons = (b) =>
+  (keyBar(b)?.children ?? []).filter((e) => e.tagName === "button" && e.style.display !== "none");
+const visibleSeparators = (b) =>
+  (keyBar(b)?.children ?? []).filter((e) => e.tagName === "span" && e.style.display !== "none");
+const tap = (button) => (button?._listeners.pointerdown ?? []).forEach((fn) => fn({ preventDefault() {} }));
+const switchByLabel = (tree, label) =>
+  findElement(tree, (node) => node.props?.role === "switch" && node.props?.["aria-label"] === label);
+const findElement = (node, predicate) => {
+  if (node === null || node === undefined) return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElement(child, predicate);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (predicate(node)) return node;
+  for (const child of node.children ?? []) {
+    const found = findElement(child, predicate);
+    if (found) return found;
+  }
+  return null;
+};
 const setBand = (b, height, offsetTop = 0) => {
   b.viewport.height = height;
   b.viewport.offsetTop = offsetTop;
@@ -332,6 +435,261 @@ console.log("\nBox model: the shell spans the band exactly");
   check("padding held during the close grace", bodyPadVar(b), "0px");
   b.tick();
   check("body padding returns", bodyPadVar(b), "24px");
+}
+
+console.log("\nKey bar");
+
+const bootKeyBar = (stored = {}, options = {}) => {
+  const b = boot({ standalone: true, envTop: 24, stored: { watchdog: false, ...stored }, ...options });
+  setBand(b, 874);
+  b.fireViewportEvent();
+  return b;
+};
+
+{
+  const b = bootKeyBar();
+  check("the bar is on by default", keyBarOn(b), true);
+  check("all switches default on", b.exports.keyBar.get(), {
+    enabled: true,
+    groups: ["esc", "tab", "modifiers", "arrows", "newline"],
+  });
+  check("the bar has its own style", findKeyBarStyle(b, "padding-bottom: var(--dsh-ios-keybar-h"), true);
+  check("the bar follows the visible band", findKeyBarStyle(b, "top: calc(var(--dsh-ios-vvh"), true);
+}
+{
+  const b = bootKeyBar({ keyBar: false });
+  check("an explicit master off hides the bar", keyBarOn(b), false);
+  check("master off keeps the default groups", b.exports.keyBar.get(), {
+    enabled: false,
+    groups: ["esc", "tab", "modifiers", "arrows", "newline"],
+  });
+}
+{
+  const b = bootKeyBar({ keyBar: true });
+  const composer = b.doc.createElement("div");
+  composer.isContentEditable = true;
+  b.doc.activeElement = composer;
+  const events = [];
+  const dispatch = composer.dispatchEvent.bind(composer);
+  composer.dispatchEvent = (event) => {
+    events.push(event);
+    return dispatch(event);
+  };
+
+  tap(barButton(b, "Esc"));
+  check("Esc sends keydown and keyup", events.map((event) => [event.type, event.key]), [
+    ["keydown", "Escape"],
+    ["keyup", "Escape"],
+  ]);
+  check("Esc carries no modifier", events[0].ctrlKey, false);
+
+  events.length = 0;
+  tap(barButton(b, "\u2192"));
+  check("an arrow sends ArrowRight", events.map((event) => event.key), ["ArrowRight", "ArrowRight"]);
+  check("the contenteditable fallback moves the caret", b.selectionMoves.at(-1), ["move", "forward", "character"]);
+
+  events.length = 0;
+  tap(barButton(b, "\u21b5"));
+  check("the new line key sends Shift+Enter", [events[0].key, events[0].shiftKey], ["Enter", true]);
+
+  events.length = 0;
+  tap(barButton(b, "Ctrl"));
+  check("Ctrl arms the modifier", barButton(b, "Ctrl").getAttribute("aria-pressed"), "true");
+  tap(barButton(b, "\u2190"));
+  check("the next key carries Ctrl", events[0].ctrlKey, true);
+  check("the modifier clears after one key", barButton(b, "Ctrl").getAttribute("aria-pressed"), "false");
+  events.length = 0;
+  tap(barButton(b, "\u2192"));
+  check("the following key has no Ctrl", events[0].ctrlKey, false);
+
+  events.length = 0;
+  tap(barButton(b, "Shift"));
+  tap(barButton(b, "\u2190"));
+  check("Shift extends the selection", [events[0].shiftKey, b.selectionMoves.at(-1)], [true, ["extend", "backward", "character"]]);
+
+  events.length = 0;
+  tap(barButton(b, "Ctrl"));
+  tap(barButton(b, "\u21b5"));
+  check("the new line key ignores an armed modifier", [events[0].key, events[0].shiftKey, events[0].ctrlKey], ["Enter", true, false]);
+}
+{
+  const b = bootKeyBar({ keyBar: true });
+  const all = ["Esc", "Tab", "Ctrl", "Alt", "Shift", "Cmd", "\u2190", "\u2191", "\u2193", "\u2192", "\u21b5"];
+  const cases = [
+    { groups: ["esc"], keys: ["Esc"], separators: 0 },
+    { groups: ["tab"], keys: ["Tab"], separators: 0 },
+    { groups: ["modifiers"], keys: ["Ctrl", "Alt", "Shift", "Cmd"], separators: 0 },
+    { groups: ["arrows"], keys: ["\u2190", "\u2191", "\u2193", "\u2192"], separators: 0 },
+    { groups: ["newline"], keys: ["\u21b5"], separators: 0 },
+    { groups: ["esc", "tab"], keys: ["Esc", "Tab"], separators: 1 },
+    { groups: ["esc", "arrows"], keys: ["Esc", "\u2190", "\u2191", "\u2193", "\u2192"], separators: 1 },
+    { groups: ["esc", "newline"], keys: ["Esc", "\u21b5"], separators: 1 },
+    { groups: ["modifiers", "arrows", "newline"], keys: ["Ctrl", "Alt", "Shift", "Cmd", "\u2190", "\u2191", "\u2193", "\u2192", "\u21b5"], separators: 2 },
+    { groups: ["esc", "tab", "modifiers", "arrows", "newline"], keys: all, separators: 4 },
+  ];
+  for (const item of cases) {
+    b.exports.keyBar.set({ enabled: true, groups: item.groups });
+    const label = item.groups.join("+");
+    check(`${label} keys`, visibleBarButtons(b).map((e) => e.textContent), item.keys);
+    check(`${label} separators`, visibleSeparators(b).length, item.separators);
+  }
+
+  b.exports.keyBar.set({ enabled: true, groups: [] });
+  check("no groups hide the bar", keyBarOn(b), false);
+  b.exports.keyBar.set({ enabled: true, groups: ["esc"] });
+  check("one group shows the bar", keyBarOn(b), true);
+
+  setBand(b, 1194);
+  b.fireViewportEvent();
+  b.advance(250);
+  check("the bar hides when the keyboard closes", keyBarOn(b), false);
+  setBand(b, 874);
+  b.fireViewportEvent();
+  check("the bar returns on the next keyboard", keyBarOn(b), true);
+
+  b.dispose();
+  check("dispose removes the bar", keyBar(b), null);
+  check("dispose removes the bar style", findKeyBarStyle(b, "--dsh-ios-keybar-h"), false);
+  check("dispose removes the bar class", keyBarOn(b), false);
+}
+{
+  const b = bootKeyBar({ keyBar: true, keyBarGroups: ["newline"], keyBarGroupsVersion: 2 });
+  check("the master and groups combine", visibleBarButtons(b).map((e) => e.textContent), ["\u21b5"]);
+}
+{
+  const b = bootKeyBar({ keyBar: true, keyBarGroups: ["navigation"], keyBarGroupsVersion: 2 });
+  check("the old navigation group expands to Esc and arrows", visibleBarButtons(b).map((e) => e.textContent), [
+    "Esc", "\u2190", "\u2191", "\u2193", "\u2192",
+  ]);
+  check("the expanded pair has one separator", visibleSeparators(b).length, 1);
+}
+{
+  const b = bootKeyBar({ keyBar: true, keyBarGroups: ["esc", "modifiers", "arrows", "newline"] });
+  check("a pre-Tab selection gains Tab", b.exports.keyBar.get().groups, ["esc", "tab", "modifiers", "arrows", "newline"]);
+  check("the migrated Tab is visible", visibleBarButtons(b).some((e) => e.textContent === "Tab"), true);
+}
+{
+  const b = bootKeyBar({ keyBar: true, keyBarGroups: ["esc", "modifiers", "arrows", "newline"], keyBarGroupsVersion: 2 });
+  check("a version 2 selection can omit Tab", b.exports.keyBar.get().groups, ["esc", "modifiers", "arrows", "newline"]);
+  check("the omitted Tab is hidden", visibleBarButtons(b).some((e) => e.textContent === "Tab"), false);
+}
+{
+  const ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)";
+  const b = bootKeyBar({ keyBar: true }, { userAgent: ua });
+  const labels = visibleBarButtons(b).map((e) => e.textContent);
+  check("iPhone keeps Ctrl, Alt, and Shift", ["Ctrl", "Alt", "Shift"].every((label) => labels.includes(label)), true);
+  check("iPhone has no Cmd", labels.includes("Cmd"), false);
+}
+{
+  const b = bootKeyBar({ keyBar: true, keyBarGroups: ["tab", "arrows", "newline"], keyBarGroupsVersion: 2 });
+  const area = b.doc.createElement("textarea");
+  area.value = "hello\nworld";
+  area.selectionStart = 8;
+  area.selectionEnd = 8;
+  b.doc.activeElement = area;
+
+  tap(barButton(b, "\u2191"));
+  check("the textarea fallback moves up one line", [area.selectionStart, area.selectionEnd], [2, 2]);
+
+  area.selectionStart = 5;
+  area.selectionEnd = 5;
+  tap(barButton(b, "\u21b5"));
+  check("the textarea new line inserts a break", area.value, "hello\n\nworld");
+  check("the caret follows the inserted break", area.selectionStart, 6);
+
+  area.selectionStart = 6;
+  area.selectionEnd = 6;
+  tap(barButton(b, "Tab"));
+  check("the textarea Tab inserts a tab", area.value, "hello\n\t\nworld");
+  check("the caret follows the tab", area.selectionStart, 7);
+}
+
+console.log("\nPlugin settings card");
+{
+  let state;
+  let initialized = false;
+  const fakeReact = {
+    createElement(type, props, ...children) {
+      return { type, props: props ?? {}, children };
+    },
+    useState(initial) {
+      if (!initialized) {
+        state = initial;
+        initialized = true;
+      }
+      return [state, (next) => { state = next; }];
+    },
+    useEffect(fn) {
+      fn();
+    },
+  };
+  let registration = null;
+  const slots = {
+    inject: (name, callback) => {
+      callback();
+    },
+    register: (options, component) => {
+      registration = { options, component };
+      return () => {};
+    },
+  };
+  const b = boot(
+    { standalone: false },
+    {
+      requires: { react: fakeReact },
+      context: {
+        inject: (services, callback) => {
+          callback({ slots });
+        },
+      },
+    },
+  );
+  check("the card registers on the Plugins page", registration !== null, true);
+  check("the card names the bundle", registration?.options.key, "dsh-ios-pwa-fix");
+  check("the card uses the bundle config slot", registration?.options.name, "plugins.bundle.config");
+  check("the card registers a locale namespace", registration?.options.locale, "iosPwaFix");
+
+  const props = registration?.options.inject() ?? {};
+  const t = (key) => "T:" + key;
+  const render = () => registration.component({ ...props, t });
+  const sw = (tree, name) => switchByLabel(tree, "T:settings." + name);
+  const names = ["master", "esc", "tab", "modifiers", "arrows", "newline"];
+
+  const first = render();
+  check("the card has six switches", names.map((name) => Boolean(sw(first, name))), names.map(() => true));
+  check("all switches start on", names.map((name) => sw(first, name)?.props["aria-checked"]), names.map(() => true));
+  check("the group switches start enabled", sw(first, "arrows")?.props.disabled, false);
+
+  sw(first, "arrows")?.props.onClick();
+  check("arrows can be turned off", JSON.parse(b.windowRef.localStorage.getItem(STORAGE_KEY)).keyBarGroups, ["esc", "tab", "modifiers", "newline"]);
+  const second = render();
+  check("arrows read back off", sw(second, "arrows")?.props["aria-checked"], false);
+  check("Esc stays on", sw(second, "esc")?.props["aria-checked"], true);
+
+  sw(second, "newline")?.props.onClick();
+  check("newline can be turned off", JSON.parse(b.windowRef.localStorage.getItem(STORAGE_KEY)).keyBarGroups, ["esc", "tab", "modifiers"]);
+  const third = render();
+
+  sw(third, "master")?.props.onClick();
+  const masterOff = JSON.parse(b.windowRef.localStorage.getItem(STORAGE_KEY));
+  check("the master turns off", masterOff.keyBar, false);
+  check("the master keeps the groups", masterOff.keyBarGroups, ["esc", "tab", "modifiers"]);
+  const fourth = render();
+  check("groups disable while the master is off", sw(fourth, "modifiers")?.props.disabled, true);
+
+  const before = b.windowRef.localStorage.getItem(STORAGE_KEY);
+  sw(fourth, "modifiers")?.props.onClick();
+  check("a disabled group does not write", b.windowRef.localStorage.getItem(STORAGE_KEY), before);
+
+  sw(fourth, "master")?.props.onClick();
+  const masterOn = JSON.parse(b.windowRef.localStorage.getItem(STORAGE_KEY));
+  check("the master turns on", masterOn.keyBar, true);
+  check("the master restores the groups", masterOn.keyBarGroups, ["esc", "tab", "modifiers"]);
+  const fifth = render();
+  check("groups enable while the master is on", sw(fifth, "modifiers")?.props.disabled, false);
+
+  sw(fifth, "tab")?.props.onClick();
+  check("Tab can be turned off", JSON.parse(b.windowRef.localStorage.getItem(STORAGE_KEY)).keyBarGroups, ["esc", "modifiers"]);
 }
 
 console.log("\nKeyboard opens: shell pinned to the visible band");
@@ -595,6 +953,8 @@ console.log("\nDispose: every trace removed");
   b.dispose();
   check("style removed", b.registry.some((e) => e.id === "dsh-ios-pwa-fix-style"), false);
   check("strip removed", b.registry.some((e) => e.id === "dsh-ios-pwa-fix-strip"), false);
+  check("key bar removed", keyBar(b), null);
+  check("key bar style removed", b.registry.some((e) => e.id === "dsh-ios-pwa-keybar-style"), false);
   check("root classes removed", [...b.documentElement._classes], []);
   check("height variables removed", [heightVar(b), topVar(b)], [undefined, undefined]);
   check("inline body height removed", inlineHeight(b), "");
@@ -625,6 +985,8 @@ console.log("\nSecond materialisation (HMR) does not stack a second patch");
   b.exports.apply({ effect: () => {} });
   check("still one style element", b.registry.filter((e) => e.id === "dsh-ios-pwa-fix-style").length, 1);
   check("still one strip element", b.registry.filter((e) => e.id === "dsh-ios-pwa-fix-strip").length, 1);
+  check("still one key bar element", b.registry.filter((e) => e.id === "dsh-ios-pwa-keybar").length, 1);
+  check("still one key bar style", b.registry.filter((e) => e.id === "dsh-ios-pwa-keybar-style").length, 1);
 }
 
 console.log(failures === 0 ? "\nAll checks passed." : `\n${failures} check(s) failed.`);

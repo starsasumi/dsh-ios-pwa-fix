@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "iOS Web App Fix",
+    "description": "Keeps the DSH web GUI usable as an iPhone and iPad Home Screen app, with an optional key bar and switchable key groups."
+  }
+}
